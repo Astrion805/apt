@@ -1,0 +1,16 @@
+<link rel="stylesheet" href="/static/style.css">
+<h2>Apt Feed</h2>
+
+<form method="post">
+  <input name="post" placeholder="What’s on your mind?">
+  <button>Post</button>
+</form>
+
+{% for p in posts %}
+<div class="post">
+  <b>{{ p[1] }}</b><br>
+  {{ p[2] }}
+</div>
+{% endfor %}
+
+<a href="/logout">Logout</a>
