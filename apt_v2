@@ -1,0 +1,1072 @@
+# app.py
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3, os, traceback
+from datetime import timedelta, datetime
+
+app = Flask(__name__)
+app.secret_key = "supersecret-apt-key"
+DB = "apt.db"
+
+app.permanent_session_lifetime = timedelta(days=30)
+@app.before_request
+def make_session_permanent():
+    session.permanent = True
+
+# ---------------- DB helpers ----------------
+def connect_db():
+    return sqlite3.connect(DB, check_same_thread=False)
+
+def query_db(query, args=(), one=False):
+    with connect_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(query, args)
+        rv = cur.fetchall()
+        conn.commit()
+        return (rv[0] if rv else None) if one else rv
+
+def init_db():
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 username TEXT UNIQUE NOT NULL,
+                 email TEXT UNIQUE,
+                 password TEXT NOT NULL,
+                 bio TEXT DEFAULT '',
+                 avatar TEXT DEFAULT '',
+                 followers INTEGER DEFAULT 0,
+                 following INTEGER DEFAULT 0
+                 )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS posts (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user TEXT NOT NULL,
+                 caption TEXT,
+                 image TEXT,
+                 likes INTEGER DEFAULT 0,
+                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                 )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS likes (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 post_id INTEGER,
+                 user TEXT
+                 )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS comments (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 post_id INTEGER,
+                 user TEXT,
+                 text TEXT,
+                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                 )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS follows (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 follower TEXT,
+                 following TEXT
+                 )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS stories (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user TEXT,
+                 image TEXT,
+                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                 )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 sender TEXT NOT NULL,
+                 receiver TEXT,
+                 text TEXT NOT NULL,
+                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                 )""")
+    conn.commit()
+    conn.close()
+
+def ensure_columns():
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    try:
+        c.execute("PRAGMA table_info(users)")
+        cols = [r[1] for r in c.fetchall()]
+        if 'email' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        if 'bio' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''")
+        if 'avatar' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT ''")
+        if 'followers' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN followers INTEGER DEFAULT 0")
+        if 'following' not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN following INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+init_db()
+ensure_columns()
+
+def seed_data():
+    if not query_db("SELECT * FROM users LIMIT 1"):
+        query_db("INSERT INTO users(username,email,password,bio,avatar) VALUES(?,?,?,?,?)",
+                 ["alice","alice@example.com", generate_password_hash("password"), "✨ Creator | Traveler | Coffee addict", "https://i.pravatar.cc/150?img=1"])
+        query_db("INSERT INTO users(username,email,password,bio,avatar) VALUES(?,?,?,?,?)",
+                 ["bob","bob@example.com", generate_password_hash("password"), "🎨 Designer | Minimalist", "https://i.pravatar.cc/150?img=3"])
+        query_db("INSERT INTO users(username,email,password,bio,avatar) VALUES(?,?,?,?,?)",
+                 ["carol","carol@example.com", generate_password_hash("password"), "📷 Photographer", "https://i.pravatar.cc/150?img=5"])
+    if not query_db("SELECT * FROM posts LIMIT 1"):
+        query_db("INSERT INTO posts(user,caption,image) VALUES(?,?,?)",
+                 ["alice","Golden hour magic ✨ #sunset #photography","https://picsum.photos/600/600?random=1"])
+        query_db("INSERT INTO posts(user,caption,image) VALUES(?,?,?)",
+                 ["bob","Minimalist workspace setup 🖥️","https://picsum.photos/600/600?random=2"])
+        query_db("INSERT INTO posts(user,caption,image) VALUES(?,?,?)",
+                 ["carol","Street photography in the city 🌃","https://picsum.photos/600/600?random=3"])
+        query_db("INSERT INTO posts(user,caption,image) VALUES(?,?,?)",
+                 ["alice","Coffee and contemplation ☕","https://picsum.photos/600/600?random=4"])
+
+seed_data()
+
+@app.context_processor
+def inject_user():
+    return dict(current_user=session.get("user"))
+
+# ---------------- Instagram-like CSS ----------------
+BASE_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { 
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #fafafa;
+    color: #262626;
+}
+.container { max-width: 935px; margin: 60px auto 0; padding: 30px 20px; }
+.header { 
+    position: fixed; 
+    top: 0; 
+    left: 0; 
+    right: 0; 
+    height: 54px; 
+    background: #fff; 
+    border-bottom: 1px solid #dbdbdb; 
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.header-inner {
+    max-width: 935px;
+    width: 100%;
+    padding: 0 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.logo { 
+    font-size: 24px; 
+    font-weight: 700; 
+    color: #000;
+    text-decoration: none;
+    font-family: 'Billabong', cursive;
+    letter-spacing: 1px;
+}
+.nav-icons {
+    display: flex;
+    gap: 22px;
+    align-items: center;
+}
+.nav-icons a {
+    color: #262626;
+    font-size: 24px;
+    text-decoration: none;
+}
+.search-bar {
+    padding: 6px 16px;
+    border: 1px solid #dbdbdb;
+    border-radius: 8px;
+    background: #efefef;
+    width: 268px;
+    font-size: 14px;
+}
+.stories {
+    background: #fff;
+    border: 1px solid #dbdbdb;
+    border-radius: 8px;
+    padding: 16px 0;
+    margin-bottom: 24px;
+    overflow-x: auto;
+    white-space: nowrap;
+}
+.story-list {
+    display: flex;
+    gap: 16px;
+    padding: 0 18px;
+}
+.story {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    min-width: 66px;
+    cursor: pointer;
+}
+.story-avatar {
+    width: 66px;
+    height: 66px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    background: linear-gradient(45deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%);
+    padding: 2px;
+    position: relative;
+}
+.story-avatar img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid #fff;
+}
+.story-username {
+    font-size: 12px;
+    color: #262626;
+    max-width: 66px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.feed {
+    display: flex;
+    gap: 28px;
+}
+.feed-main {
+    flex: 1;
+    max-width: 614px;
+}
+.sidebar {
+    width: 319px;
+    position: sticky;
+    top: 84px;
+    height: fit-content;
+}
+.post-card {
+    background: #fff;
+    border: 1px solid #dbdbdb;
+    border-radius: 8px;
+    margin-bottom: 24px;
+}
+.post-header {
+    display: flex;
+    align-items: center;
+    padding: 14px 16px;
+    gap: 12px;
+}
+.post-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    object-fit: cover;
+}
+.post-user {
+    font-weight: 600;
+    font-size: 14px;
+    color: #262626;
+    text-decoration: none;
+}
+.post-image {
+    width: 100%;
+    display: block;
+    border-top: 1px solid #efefef;
+    border-bottom: 1px solid #efefef;
+}
+.post-actions {
+    padding: 6px 16px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+}
+.action-btn {
+    background: none;
+    border: none;
+    font-size: 24px;
+    cursor: pointer;
+    padding: 8px;
+}
+.action-btn.liked {
+    color: #ed4956;
+}
+.post-likes {
+    padding: 0 16px 8px;
+    font-weight: 600;
+    font-size: 14px;
+}
+.post-caption {
+    padding: 0 16px 8px;
+    font-size: 14px;
+    line-height: 18px;
+}
+.caption-user {
+    font-weight: 600;
+    margin-right: 6px;
+}
+.post-comments {
+    padding: 0 16px 8px;
+}
+.comment {
+    font-size: 14px;
+    margin-bottom: 4px;
+    line-height: 18px;
+}
+.comment-user {
+    font-weight: 600;
+    margin-right: 6px;
+}
+.view-comments {
+    color: #8e8e8e;
+    font-size: 14px;
+    padding: 0 16px 8px;
+    cursor: pointer;
+}
+.post-time {
+    padding: 0 16px 8px;
+    font-size: 10px;
+    color: #8e8e8e;
+    text-transform: uppercase;
+}
+.add-comment {
+    border-top: 1px solid #efefef;
+    display: flex;
+    padding: 6px 16px;
+}
+.add-comment input {
+    flex: 1;
+    border: none;
+    outline: none;
+    font-size: 14px;
+    padding: 8px 0;
+}
+.add-comment button {
+    background: none;
+    border: none;
+    color: #0095f6;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+}
+.suggestions {
+    padding: 16px 0;
+}
+.suggestion-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+.suggestion-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #8e8e8e;
+}
+.suggestion-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+.suggestion-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    object-fit: cover;
+}
+.suggestion-info {
+    flex: 1;
+}
+.suggestion-username {
+    font-size: 14px;
+    font-weight: 600;
+    color: #262626;
+}
+.suggestion-subtitle {
+    font-size: 12px;
+    color: #8e8e8e;
+}
+.follow-btn {
+    background: none;
+    border: none;
+    color: #0095f6;
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+}
+.profile-card {
+    background: #fff;
+    padding: 20px;
+    border-radius: 8px;
+    border: 1px solid #dbdbdb;
+    margin-bottom: 20px;
+}
+.profile-header {
+    display: flex;
+    align-items: center;
+    gap: 80px;
+    margin-bottom: 44px;
+}
+.profile-avatar-large {
+    width: 150px;
+    height: 150px;
+    border-radius: 50%;
+    object-fit: cover;
+}
+.profile-info {
+    flex: 1;
+}
+.profile-username {
+    font-size: 28px;
+    font-weight: 300;
+    margin-bottom: 20px;
+}
+.profile-stats {
+    display: flex;
+    gap: 40px;
+    margin-bottom: 20px;
+}
+.stat {
+    font-size: 16px;
+}
+.stat-value {
+    font-weight: 600;
+}
+.profile-bio {
+    font-size: 14px;
+    line-height: 20px;
+}
+.profile-tabs {
+    border-top: 1px solid #dbdbdb;
+    display: flex;
+    justify-content: center;
+    gap: 60px;
+    padding-top: 16px;
+    margin-bottom: 28px;
+}
+.tab {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: #8e8e8e;
+    cursor: pointer;
+}
+.tab.active {
+    color: #262626;
+}
+.profile-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 28px;
+}
+.grid-item {
+    position: relative;
+    padding-bottom: 100%;
+    background: #fafafa;
+    cursor: pointer;
+}
+.grid-item img {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.btn-primary {
+    background: #0095f6;
+    color: #fff;
+    border: none;
+    padding: 8px 24px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+}
+.btn-secondary {
+    background: #efefef;
+    color: #262626;
+    border: none;
+    padding: 8px 24px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+}
+.form-group {
+    margin-bottom: 16px;
+}
+.form-label {
+    display: block;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+.form-control {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid #dbdbdb;
+    border-radius: 6px;
+    font-size: 14px;
+    background: #fafafa;
+}
+.form-control:focus {
+    outline: none;
+    border-color: #a8a8a8;
+}
+textarea.form-control {
+    resize: vertical;
+    min-height: 80px;
+}
+.auth-container {
+    max-width: 350px;
+    margin: 100px auto;
+}
+.auth-card {
+    background: #fff;
+    border: 1px solid #dbdbdb;
+    padding: 40px;
+    margin-bottom: 10px;
+}
+.auth-logo {
+    text-align: center;
+    font-size: 48px;
+    font-weight: 700;
+    margin-bottom: 30px;
+}
+.divider {
+    display: flex;
+    align-items: center;
+    text-align: center;
+    color: #8e8e8e;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 20px 0;
+}
+.divider::before,
+.divider::after {
+    content: '';
+    flex: 1;
+    border-bottom: 1px solid #dbdbdb;
+}
+.divider span {
+    padding: 0 18px;
+}
+.text-center {
+    text-align: center;
+}
+.link {
+    color: #0095f6;
+    text-decoration: none;
+    font-weight: 600;
+}
+.alert {
+    padding: 12px;
+    background: #ffe9e9;
+    color: #ed4956;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 14px;
+}
+@media (max-width: 768px) {
+    .sidebar { display: none; }
+    .feed-main { max-width: 100%; }
+    .container { padding: 10px; }
+    .profile-header { flex-direction: column; gap: 20px; text-align: center; }
+    .profile-grid { grid-template-columns: repeat(3, 1fr); gap: 4px; }
+}
+</style>
+<link href="https://fonts.googleapis.com/css2?family=Billabong&display=swap" rel="stylesheet">
+"""
+
+HEADER = """
+<div class="header">
+    <div class="header-inner">
+        <a href="{{ url_for('home') }}" class="logo">APT</a>
+        <div class="nav-icons">
+            <a href="{{ url_for('home') }}">🏠</a>
+            <a href="{{ url_for('messages') }}">💬</a>
+            <a href="{{ url_for('explore') }}">🔍</a>
+            {% if current_user %}
+                <a href="{{ url_for('profile', username=current_user) }}">👤</a>
+            {% else %}
+                <a href="{{ url_for('login') }}">🔐</a>
+            {% endif %}
+        </div>
+    </div>
+</div>
+"""
+
+# ---------------- Templates ----------------
+LOGIN_TMPL = BASE_CSS + """
+<div class="auth-container">
+    <div class="auth-card">
+        <div class="auth-logo">APT</div>
+        {% with messages = get_flashed_messages() %}
+            {% for m in messages %}<div class="alert">{{ m }}</div>{% endfor %}
+        {% endwith %}
+        <form method="POST">
+            <div class="form-group">
+                <input class="form-control" name="login_id" placeholder="Username or email" required>
+            </div>
+            <div class="form-group">
+                <input class="form-control" name="password" type="password" placeholder="Password" required>
+            </div>
+            <button class="btn-primary" type="submit" style="width:100%">Log In</button>
+        </form>
+    </div>
+    <div class="auth-card">
+        <p class="text-center">Don't have an account? <a href="{{ url_for('signup') }}" class="link">Sign up</a></p>
+    </div>
+</div>
+"""
+
+SIGNUP_TMPL = BASE_CSS + """
+<div class="auth-container">
+    <div class="auth-card">
+        <div class="auth-logo">APT</div>
+        <p class="text-center" style="color:#8e8e8e;margin-bottom:20px">Sign up to see photos and videos from your friends.</p>
+        {% with messages = get_flashed_messages() %}
+            {% for m in messages %}<div class="alert">{{ m }}</div>{% endfor %}
+        {% endwith %}
+        <form method="POST">
+            <div class="form-group">
+                <input class="form-control" name="email" type="email" placeholder="Email" required>
+            </div>
+            <div class="form-group">
+                <input class="form-control" name="username" placeholder="Username" required>
+            </div>
+            <div class="form-group">
+                <input class="form-control" name="password" type="password" placeholder="Password" required>
+            </div>
+            <div class="form-group">
+                <input class="form-control" name="confirm" type="password" placeholder="Confirm Password" required>
+            </div>
+            <button class="btn-primary" type="submit" style="width:100%">Sign Up</button>
+        </form>
+    </div>
+    <div class="auth-card">
+        <p class="text-center">Have an account? <a href="{{ url_for('login') }}" class="link">Log in</a></p>
+    </div>
+</div>
+"""
+
+HOME_TMPL = BASE_CSS + HEADER + """
+<div class="container">
+    <div class="stories">
+        <div class="story-list">
+            {% for u in story_users %}
+            <div class="story">
+                <div class="story-avatar">
+                    <img src="{{ u.avatar or 'https://i.pravatar.cc/150?u=' + u.username }}" alt="{{ u.username }}">
+                </div>
+                <span class="story-username">{{ u.username }}</span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    
+    <div class="feed">
+        <div class="feed-main">
+            {% for post in posts %}
+            <div class="post-card">
+                <div class="post-header">
+                    <img class="post-avatar" src="{{ post.avatar or 'https://i.pravatar.cc/150?u=' + post.user }}" alt="{{ post.user }}">
+                    <a href="{{ url_for('profile', username=post.user) }}" class="post-user">{{ post.user }}</a>
+                </div>
+                <img class="post-image" src="{{ post.image }}" alt="Post">
+                <div class="post-actions">
+                    <form method="POST" action="{{ url_for('toggle_like', post_id=post.id) }}" style="display:inline">
+                        <button class="action-btn {% if post.user_liked %}liked{% endif %}" type="submit">
+                            {% if post.user_liked %}❤️{% else %}🤍{% endif %}
+                        </button>
+                    </form>
+                    <button class="action-btn">💬</button>
+                    <button class="action-btn">📤</button>
+                </div>
+                <div class="post-likes">{{ post.likes }} likes</div>
+                {% if post.caption %}
+                <div class="post-caption">
+                    <span class="caption-user">{{ post.user }}</span>{{ post.caption }}
+                </div>
+                {% endif %}
+                {% if post.comment_count > 0 %}
+                <div class="view-comments">View all {{ post.comment_count }} comments</div>
+                {% endif %}
+                {% for c in post.recent_comments %}
+                <div class="post-comments">
+                    <div class="comment">
+                        <span class="comment-user">{{ c.user }}</span>{{ c.text }}
+                    </div>
+                </div>
+                {% endfor %}
+                <div class="post-time">{{ post.time_ago }}</div>
+                <form method="POST" action="{{ url_for('add_comment', post_id=post.id) }}" class="add-comment">
+                    <input name="comment" placeholder="Add a comment...">
+                    <button type="submit">Post</button>
+                </form>
+            </div>
+            {% endfor %}
+        </div>
+        
+        <div class="sidebar">
+            <div class="suggestions">
+                <div class="suggestion-header">
+                    <span class="suggestion-title">Suggestions For You</span>
+                </div>
+                {% for user in suggestions %}
+                <div class="suggestion-item">
+                    <img class="suggestion-avatar" src="{{ user.avatar or 'https://i.pravatar.cc/150?u=' + user.username }}" alt="{{ user.username }}">
+                    <div class="suggestion-info">
+                        <div class="suggestion-username">{{ user.username }}</div>
+                        <div class="suggestion-subtitle">Suggested for you</div>
+                    </div>
+                    <button class="follow-btn">Follow</button>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+"""
+
+PROFILE_TMPL = BASE_CSS + HEADER + """
+<div class="container">
+    <div class="profile-card">
+        <div class="profile-header">
+            <img class="profile-avatar-large" src="{{ user_row.avatar or 'https://i.pravatar.cc/300?u=' + user_row.username }}" alt="{{ user_row.username }}">
+            <div class="profile-info">
+                <div class="profile-username">{{ user_row.username }}</div>
+                <div class="profile-stats">
+                    <div class="stat"><span class="stat-value">{{ posts|length }}</span> posts</div>
+                    <div class="stat"><span class="stat-value">{{ user_row.followers }}</span> followers</div>
+                    <div class="stat"><span class="stat-value">{{ user_row.following }}</span> following</div>
+                </div>
+                <div class="profile-bio">{{ user_row.bio }}</div>
+                {% if can_edit %}
+                    <div style="margin-top:20px">
+                        <a href="{{ url_for('edit_profile') }}" class="btn-secondary">Edit Profile</a>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+        
+        <div class="profile-tabs">
+            <div class="tab active">POSTS</div>
+            <div class="tab">SAVED</div>
+            <div class="tab">TAGGED</div>
+        </div>
+        
+        <div class="profile-grid">
+            {% for p in posts %}
+            <div class="grid-item">
+                <img src="{{ p.image }}" alt="Post">
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+"""
+
+UPLOAD_TMPL = BASE_CSS + HEADER + """
+<div class="container" style="max-width:600px">
+    <div class="profile-card">
+        <h2 style="margin-bottom:20px">Create New Post</h2>
+        {% with messages = get_flashed_messages() %}
+            {% for m in messages %}<div class="alert">{{ m }}</div>{% endfor %}
+        {% endwith %}
+        <form method="POST">
+            <div class="form-group">
+                <label class="form-label">Image URL</label>
+                <input class="form-control" name="image" placeholder="https://..." required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Caption</label>
+                <textarea class="form-control" name="caption" placeholder="Write a caption..."></textarea>
+            </div>
+            <button class="btn-primary" type="submit">Share</button>
+        </form>
+    </div>
+</div>
+"""
+
+EDIT_PROFILE_TMPL = BASE_CSS + HEADER + """
+<div class="container" style="max-width:600px">
+    <div class="profile-card">
+        <h2 style="margin-bottom:20px">Edit Profile</h2>
+        <form method="POST">
+            <div class="form-group">
+                <label class="form-label">Avatar URL</label>
+                <input class="form-control" name="avatar" value="{{ user_row.avatar }}" placeholder="https://...">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Bio</label>
+                <textarea class="form-control" name="bio">{{ user_row.bio }}</textarea>
+            </div>
+            <button class="btn-primary" type="submit">Save</button>
+            <a href="{{ url_for('profile', username=current_user) }}" class="btn-secondary" style="margin-left:10px">Cancel</a>
+        </form>
+    </div>
+</div>
+"""
+
+MESSAGES_TMPL = BASE_CSS + HEADER + """
+<div class="container" style="max-width:800px">
+    <div class="profile-card">
+        <h2>Messages</h2>
+        <p style="color:#8e8e8e;margin-top:10px">Feature coming soon...</p>
+    </div>
+</div>
+"""
+
+EXPLORE_TMPL = BASE_CSS + HEADER + """
+<div class="container">
+    <div class="profile-grid">
+        {% for p in posts %}
+        <div class="grid-item">
+            <img src="{{ p.image }}" alt="Post">
+        </div>
+        {% endfor %}
+    </div>
+</div>
+"""
+
+# ---------------- Routes ----------------
+@app.route("/signup", methods=["GET","POST"])
+def signup():
+    if request.method == "POST":
+        username = request.form.get("username","").strip()
+        email = request.form.get("email","").strip()
+        password = request.form.get("password","")
+        confirm = request.form.get("confirm","")
+        if not username or not email or not password:
+            flash("Please fill all fields")
+            return redirect(url_for("signup"))
+        if password != confirm:
+            flash("Passwords do not match")
+            return redirect(url_for("signup"))
+        if query_db("SELECT * FROM users WHERE username=? OR email=?", [username, email], one=True):
+            flash("Username or email already exists")
+            return redirect(url_for("signup"))
+        hashed = generate_password_hash(password)
+        query_db("INSERT INTO users(username,email,password) VALUES(?,?,?)", [username, email, hashed])
+        session["user"] = username
+        flash("Account created!")
+        return redirect(url_for("home"))
+    return render_template_string(SIGNUP_TMPL)
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method == "POST":
+        login_id = request.form.get("login_id","").strip()
+        password = request.form.get("password","")
+        row = query_db("SELECT * FROM users WHERE username=? OR email=?", [login_id, login_id], one=True)
+        if not row or not check_password_hash(row["password"], password):
+            flash("Invalid username/email or password")
+            return redirect(url_for("login"))
+        session["user"] = row["username"]
+        return redirect(url_for("home"))
+    return render_template_string(LOGIN_TMPL)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+def time_ago(timestamp):
+    if not timestamp:
+        return "just now"
+    try:
+        post_time = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        diff = now - post_time
+        
+        seconds = diff.total_seconds()
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            minutes = int(seconds / 60)
+            return f"{minutes}m ago"
+        elif seconds < 86400:
+            hours = int(seconds / 3600)
+            return f"{hours}h ago"
+        else:
+            days = int(seconds / 86400)
+            return f"{days}d ago"
+    except:
+        return "just now"
+
+@app.route("/")
+@app.route("/home")
+def home():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    try:
+        # Get posts with user avatars
+        raw_posts = query_db("""
+            SELECT p.*, u.avatar 
+            FROM posts p
+            LEFT JOIN users u ON p.user = u.username
+            ORDER BY p.id DESC
+        """)
+        
+        posts = []
+        for r in raw_posts:
+            p = dict(r)
+            
+            # Check if current user liked this post
+            liked = query_db("SELECT * FROM likes WHERE post_id=? AND user=?", 
+                           [p['id'], session.get("user")], one=True)
+            p['user_liked'] = liked is not None
+            
+            # Get comment count
+            comment_count = query_db("SELECT COUNT(*) as count FROM comments WHERE post_id=?", 
+                                    [p['id']], one=True)
+            p['comment_count'] = comment_count['count'] if comment_count else 0
+            
+            # Get recent comments (max 2)
+            raw_comments = query_db("SELECT * FROM comments WHERE post_id=? ORDER BY id DESC LIMIT 2", 
+                                   [p['id']])
+            p['recent_comments'] = [dict(c) for c in raw_comments]
+            
+            # Format time
+            p['time_ago'] = time_ago(p.get('timestamp'))
+            
+            posts.append(p)
+        
+        # Get story users (all users except current)
+        story_users = query_db("SELECT username, avatar FROM users WHERE username != ? LIMIT 10", 
+                              [session.get("user")])
+        story_users = [dict(u) for u in story_users]
+        
+        # Get suggestions (users not followed by current user)
+        suggestions = query_db("SELECT username, avatar FROM users WHERE username != ? LIMIT 5", 
+                             [session.get("user")])
+        suggestions = [dict(u) for u in suggestions]
+        
+        return render_template_string(HOME_TMPL, posts=posts, story_users=story_users, suggestions=suggestions)
+    except Exception as e:
+        traceback.print_exc()
+        flash("An error occurred")
+        return redirect(url_for("login"))
+
+@app.route("/toggle_like/<int:post_id>", methods=["POST"])
+def toggle_like(post_id):
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    user = session.get("user")
+    try:
+        liked = query_db("SELECT * FROM likes WHERE post_id=? AND user=?", [post_id, user], one=True)
+        if liked:
+            query_db("DELETE FROM likes WHERE id=?", [liked["id"]])
+            query_db("UPDATE posts SET likes = CASE WHEN likes>0 THEN likes-1 ELSE 0 END WHERE id=?", [post_id])
+        else:
+            query_db("INSERT INTO likes(post_id,user) VALUES(?,?)", [post_id, user])
+            query_db("UPDATE posts SET likes = likes+1 WHERE id=?", [post_id])
+    except Exception as e:
+        traceback.print_exc()
+    
+    return redirect(request.referrer or url_for("home"))
+
+@app.route("/add_comment/<int:post_id>", methods=["POST"])
+def add_comment(post_id):
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    text = request.form.get("comment","").strip()
+    if text:
+        query_db("INSERT INTO comments(post_id,user,text) VALUES(?,?,?)", 
+                [post_id, session.get("user"), text])
+    
+    return redirect(request.referrer or url_for("home"))
+
+@app.route("/upload", methods=["GET","POST"])
+def upload():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    if request.method == "POST":
+        image = request.form.get("image","").strip()
+        caption = request.form.get("caption","").strip()
+        
+        if not image:
+            flash("Image URL is required")
+            return redirect(url_for("upload"))
+        
+        query_db("INSERT INTO posts(user,caption,image) VALUES(?,?,?)", 
+                [session.get("user"), caption, image])
+        flash("Post created!")
+        return redirect(url_for("home"))
+    
+    return render_template_string(UPLOAD_TMPL)
+
+@app.route("/profile/<username>", methods=["GET"])
+def profile(username):
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    row = query_db("SELECT * FROM users WHERE username=?", [username], one=True)
+    if not row:
+        flash("User not found")
+        return redirect(url_for("home"))
+    
+    user_row = dict(row)
+    can_edit = session.get("user") == username
+    
+    raw_posts = query_db("SELECT * FROM posts WHERE user=? ORDER BY id DESC", [username])
+    posts = [dict(p) for p in raw_posts]
+    
+    return render_template_string(PROFILE_TMPL, user_row=user_row, posts=posts, can_edit=can_edit)
+
+@app.route("/edit_profile", methods=["GET","POST"])
+def edit_profile():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    username = session.get("user")
+    row = query_db("SELECT * FROM users WHERE username=?", [username], one=True)
+    
+    if not row:
+        return redirect(url_for("home"))
+    
+    user_row = dict(row)
+    
+    if request.method == "POST":
+        bio = request.form.get("bio","").strip()
+        avatar = request.form.get("avatar","").strip()
+        
+        query_db("UPDATE users SET bio=?, avatar=? WHERE username=?", [bio, avatar, username])
+        flash("Profile updated!")
+        return redirect(url_for("profile", username=username))
+    
+    return render_template_string(EDIT_PROFILE_TMPL, user_row=user_row)
+
+@app.route("/messages")
+def messages():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    return render_template_string(MESSAGES_TMPL)
+
+@app.route("/explore")
+def explore():
+    if "user" not in session:
+        return redirect(url_for("login"))
+    
+    raw_posts = query_db("SELECT * FROM posts ORDER BY likes DESC, id DESC")
+    posts = [dict(p) for p in raw_posts]
+    
+    return render_template_string(EXPLORE_TMPL, posts=posts)
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    traceback.print_exc()
+    return f"Server error: {type(e).__name__}: {str(e)}", 500
+
+if __name__ == "__main__":
+    init_db()
+    ensure_columns()
+    seed_data()
+    app.run(host="0.0.0.0", port=5000, debug=True)
